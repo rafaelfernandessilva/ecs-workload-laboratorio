@@ -1,0 +1,162 @@
+name: "CI"  
+run-name: "${{ github.event.repository.name }} | Lint & Scan Security | Build & Push Image"
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'selecione o ambiente'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  
+  
+env:
+  IMAGE_NAME: ${{ github.repository }}
+  APP_NAME: ci-test-build
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  
+jobs:
+    
+    lint_dockerfile:
+      name: Lint Dockerfile
+      runs-on: ubuntu-22.04
+      
+      steps:
+        - name: "Checkout"
+          uses: actions/checkout@v5
+        - uses: hadolint/hadolint-action@v3.1.0
+          with:
+            dockerfile: Dockerfile
+    
+    
+    trivy:
+      name: Trivy Scan Security
+      runs-on: ubuntu-22.04
+      steps:
+        - name: "Checkout"
+          uses: actions/checkout@v5
+       
+        - name: Run Trivy vulnerability scanner 
+          uses: aquasecurity/trivy-action@0.33.1
+          with:
+            scan-type: 'fs'
+            scan-ref: '.'
+            severity: 'HIGH,CRITICAL'
+            format: 'table'
+            exit-code: 1
+
+    check-ecr:
+      runs-on: ubuntu-latest
+      needs: [trivy, lint_dockerfile]
+      environment:
+        name: ${{ github.event.inputs.environment || 'development' }}
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v5
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@master
+          with:
+            aws-region: ${{ env.AWS_REGION }}
+            role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+            role-session-name: ${{ github.event.repository.name }}_${{ env.GITHUB_WORKFLOW }}_${{ github.run_number }}_${{ github.run_attempt }}
+            role-duration-seconds: 1800
+        - name: Check ECR 
+          run: |
+            echo "BUILD - LOGIN ECR"
+            aws ecr get-login-password --region ${{ env.AWS_REGION}} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION}}.amazonaws.com
+
+            echo "BUILD - CREATEECR IF NOT EXISTS"
+
+            REPOSITORY_NAME="$APP_NAME"
+
+            set +e
+
+            REPO_EXISTS=$(aws ecr describe-repositories --repository-names $REPOSITORY_NAME 2>&1)
+
+            if [[ $REPO_EXISTS == *"RepositoryNotFoundException"* ]]; then
+                echo "Repositorio $REPOSITORY_NAME não encontrado. Criando..."
+
+                aws ecr create-repository --repository-name $REPOSITORY_NAME
+
+                if [ $? -eq 0 ]; then
+                    echo "Repositorio $REPOSITORY_NAME criado com sucesso."
+                else
+                    echo "Falha ao criar repositorio $REPOSITORY_NAME."
+                    exit 1 
+                fi 
+            else 
+                echo "Repositorio $REPOSITORY_NAME já existe"
+            fi 
+
+    build-and-push-image:
+      runs-on: ubuntu-latest
+      needs: [trivy, lint_dockerfile, check-ecr]
+      environment:
+        name: ${{ github.event.inputs.environment || 'development' }}
+      outputs:
+        image-digest: ${{ steps.build.outputs.digest }}
+        image-tags: ${{ steps.meta.outputs.tags }}
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v5
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@master
+          with:
+            aws-region: ${{ env.AWS_REGION }}
+            role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+            role-session-name: ${{ github.event.repository.name }}_${{ env.GITHUB_WORKFLOW }}_${{ github.run_number }}_${{ github.run_attempt }}
+            role-duration-seconds: 1800
+        - name: Login to Amazon ECR
+          uses: aws-actions/amazon-ecr-login@v1
+
+        - name: Docker Meta
+          id: meta
+          uses: docker/metadata-action@v4
+          env:
+              AWS_ECR_URL: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          with:
+              images: ${{ env.AWS_ECR_URL }}/${{ env.APP_NAME }}
+              tags: |
+                  type=ref,event=tag
+                  type=sha,prefix=,format=long
+                  type=raw,value=latest,enable={{is_default_branch}}
+      
+        - name: Build and Push Image
+          id: build
+          uses: docker/build-push-action@v6
+          with:
+              context: ${{ github.workspace }}
+              tags: ${{ steps.meta.outputs.tags }}
+              labels: ${{ steps.meta.outputs.labels }}
+              push: ${{ github.event_name != 'pull_request' }}
+    
+    repository-dispatch:
+      name: Trigger Deployment Workflow
+      runs-on: ubuntu-latest
+      needs: build-and-push-image
+      environment:
+        name: ${{ github.event.inputs.environment || 'development' }}
+      steps:
+        - name: Trigger deployment workflow
+          uses: peter-evans/repository-dispatch@v4
+          with:
+            token: ${{ secrets.GHCR_TOKEN }}
+            repository: "rafaelfernandessilva/ecs-workload-lab"
+            event-type: deploy-ci-test-build
+            client-payload: '{"environment": "${{ github.event.inputs.environment || ''development'' }}", "image-digest": "${{ needs.build-and-push-image.outputs.image-digest }}", "release": "${{ github.ref_name }}"}'
+        
+

@@ -1,0 +1,13 @@
+{
+  "name": "ci-test-build",
+  "version": "0.0.0-development",
+  "description": "Go application with semantic release",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rafaelfernandessilva/ci-test-build.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "semantic-release": "^22.0.0"
+  }
+}
